@@ -1,18 +1,14 @@
 package me.eugeniomarletti
 
 import com.google.auto.service.AutoService
+import kotlinx.metadata.*
+import kotlinx.metadata.jvm.KotlinClassMetadata
 import me.eugeniomarletti.Generator.Input
 import me.eugeniomarletti.Generator.Parameter
 import me.eugeniomarletti.Generator.TypeParameter
-import me.eugeniomarletti.kotlin.metadata.KotlinClassMetadata
-import me.eugeniomarletti.kotlin.metadata.KotlinMetadataUtils
-import me.eugeniomarletti.kotlin.metadata.extractFullName
-import me.eugeniomarletti.kotlin.metadata.isDataClass
-import me.eugeniomarletti.kotlin.metadata.isPrimary
-import me.eugeniomarletti.kotlin.metadata.kaptGeneratedOption
-import me.eugeniomarletti.kotlin.metadata.kotlinMetadata
-import me.eugeniomarletti.kotlin.metadata.shadow.metadata.ProtoBuf
+import me.eugeniomarletti.kotlin.metadata.*
 import me.eugeniomarletti.kotlin.processing.KotlinAbstractProcessor
+import me.eugeniomarletti.kotlin.visitors.KmTypeInfoVisitor
 import java.io.File
 import javax.annotation.processing.Processor
 import javax.annotation.processing.RoundEnvironment
@@ -23,7 +19,7 @@ import javax.tools.Diagnostic.Kind.ERROR
 
 @AutoService(Processor::class)
 @Suppress("unused")
-class DataClassWithProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils {
+class DataClassWithProcessor : KotlinAbstractProcessor() {
 
     private val annotationName = WithMethods::class.java.canonicalName
 
@@ -44,42 +40,72 @@ class DataClassWithProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils {
     private fun getInputFrom(element: Element): Input? {
         val metadata = element.kotlinMetadata
 
-        if (metadata !is KotlinClassMetadata) {
+        if (metadata !is KotlinClassMetadata.Class) {
             errorMustBeDataClass(element)
             return null
         }
 
-        val classData = metadata.data
-        val (nameResolver, classProto) = classData
+        lateinit var fqClassName: String
+        lateinit var `package`: String
+        val typeArguments = mutableListOf<TypeParameter>()
+        val typeArgsRegistry = mutableMapOf<Int, String>()
+        val parameters = mutableListOf<Parameter>()
 
-        fun ProtoBuf.Type.extractFullName() = extractFullName(classData)
+        var isDataClass = true
 
-        if (!classProto.isDataClass) {
-            errorMustBeDataClass(element)
-            return null
-        }
+        metadata.accept(object : KmClassVisitor() {
+            override fun visit(flags: Flags, name: ClassName) {
+                if (!flags.isDataClass) {
+                    isDataClass = false
+                    return
+                }
 
-        val fqClassName = nameResolver.getString(classProto.fqName).replace('/', '.')
-
-        val `package` = nameResolver.getString(classProto.fqName).substringBeforeLast('/').replace('/', '.')
-
-        val typeArguments = classProto.typeParameterList
-            .map { typeArgument ->
-                TypeParameter(
-                    name = nameResolver.getString(typeArgument.name),
-                    upperBoundsFqClassNames = typeArgument.upperBoundList.map { it.extractFullName() })
+                `package` = name.substringBeforeLast('/').fqName()
+                fqClassName = name.fqName()
             }
 
-        val parameters = classProto.constructorList
-            .single { it.isPrimary }
-            .valueParameterList
-            .map { valueParameter ->
-                Parameter(
-                    name = nameResolver.getString(valueParameter.name),
-                    fqClassName = valueParameter.type.extractFullName())
+            override fun visitConstructor(flags: Flags): KmConstructorVisitor? {
+                if (!flags.isPrimaryConstructor) {
+                    return null
+                }
+
+                return object : KmConstructorVisitor() {
+                    override fun visitValueParameter(flags: Flags, name: String): KmValueParameterVisitor? {
+                        return object : KmValueParameterVisitor() {
+                            override fun visitType(flags: Flags): KmTypeVisitor? {
+                                return KmTypeInfoVisitor(flags, typeArgsRegistry::get) {
+                                    parameters += Parameter(name, it.fqName)
+                                }
+                            }
+                        }
+                    }
+                }
             }
+
+            override fun visitTypeParameter(flags: Flags, name: String, id: Int, variance: KmVariance): KmTypeParameterVisitor? {
+                return object : KmTypeParameterVisitor() {
+                    val upperBoundsFqClassNames = arrayListOf<String>()
+
+                    override fun visitUpperBound(flags: Flags): KmTypeVisitor? {
+                        return KmTypeInfoVisitor(flags, typeArgsRegistry::get) {
+                            upperBoundsFqClassNames += it.fqName
+                        }
+                    }
+
+                    override fun visitEnd() {
+                        typeArgsRegistry += id to name
+                        typeArguments += TypeParameter(name, upperBoundsFqClassNames)
+                    }
+                }
+            }
+        })
 
         val extensionName = element.getAnnotation(WithMethods::class.java).extensionName
+
+        if (!isDataClass) {
+            errorMustBeDataClass(element)
+            return null
+        }
 
         return Input(
             fqClassName = fqClassName,
